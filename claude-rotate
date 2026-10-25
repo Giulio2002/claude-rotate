@@ -38,7 +38,7 @@ BETA = "oauth-2025-04-20"
 WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet")
 WINDOW_LABEL = {"five_hour": "5h", "seven_day": "7d", "seven_day_opus": "7d-opus", "seven_day_sonnet": "7d-sonnet"}
 REFRESH_SKEW_MS = 5 * 60 * 1000
-INACTIVE_CACHE_S = 1800  # the usage endpoint rate-limits; idle subs only need occasional checks
+INACTIVE_CACHE_S = 600  # the usage endpoint rate-limits; idle subs only need occasional checks
 
 
 class RateLimited(RuntimeError):
