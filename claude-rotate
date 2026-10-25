@@ -123,7 +123,7 @@ class Lock:
 # ---------- HTTP ----------
 
 def http(method, url, token=None, body=None, timeout=20):
-    headers = {"Content-Type": "application/json", "User-Agent": "claude-rotate/1.0"}
+    headers = {"Content-Type": "application/json", "User-Agent": "claude-code/2.1.310"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
         headers["anthropic-beta"] = BETA
