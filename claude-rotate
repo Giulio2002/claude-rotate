@@ -41,8 +41,15 @@ REFRESH_SKEW_MS = 5 * 60 * 1000
 INACTIVE_CACHE_S = 600  # the usage endpoint rate-limits; idle subs only need occasional checks
 
 
+REFRESH_BACKOFF_S = (30 * 60, 6 * 3600)  # first and max wait after a 429 from the token endpoint
+
+
 class RateLimited(RuntimeError):
     pass
+
+
+class RefreshRateLimited(RuntimeError):
+    """The token endpoint returned 429 for an idle sub's refresh."""
 
 
 def log(msg):
@@ -166,6 +173,8 @@ def refresh(oauth):
         "client_id": CLIENT_ID,
         "scope": " ".join(oauth.get("scopes") or ["user:profile", "user:inference"]),
     })
+    if code == 429:
+        raise RefreshRateLimited(f"token refresh rate-limited (HTTP 429): {data}")
     if code != 200:
         raise RuntimeError(f"token refresh failed (HTTP {code}): {data}")
     oauth = dict(oauth)
@@ -265,14 +274,37 @@ def sync_live_into_active():
 def usage_for(name, active, max_age=0):
     """Return usage dict for a sub, refreshing inactive tokens as needed.
     Results younger than max_age seconds come from the cache in state.json."""
-    cache = get_state().get("usage_cache", {})
+    state = get_state()
+    cache = state.get("usage_cache", {})
     hit = cache.get(name)
     if hit and time.time() - hit["t"] < max_age and not reset_passed(hit["usage"]):
         return hit["usage"]
-    u = _fetch_usage_for(name, active)
+    backoff = state.get("refresh_backoff", {}).get(name)
+    if backoff and time.time() < backoff["until"]:
+        return _stale_or_raise(name, hit, backoff)
+    try:
+        u = _fetch_usage_for(name, active)
+    except RefreshRateLimited:
+        # Retrying a rate-limited refresh every tick keeps it rate-limited: back off exponentially.
+        delay = min(backoff["delay"] * 2, REFRESH_BACKOFF_S[1]) if backoff else REFRESH_BACKOFF_S[0]
+        backoff = {"until": time.time() + delay, "delay": delay}
+        set_state(refresh_backoff={**state.get("refresh_backoff", {}), name: backoff})
+        return _stale_or_raise(name, hit, backoff)
     cache[name] = {"t": time.time(), "usage": u}
-    set_state(usage_cache=cache)
+    backoffs = {k: v for k, v in state.get("refresh_backoff", {}).items() if k != name}
+    set_state(usage_cache=cache, refresh_backoff=backoffs)
     return u
+
+
+def _stale_or_raise(name, hit, backoff):
+    """While a sub's refresh is backing off, decide on its last known usage instead of dropping it.
+    A stale reading can only overstate usage (windows reset downwards), so this stays conservative."""
+    wait = f"{int((backoff['until'] - time.time()) // 60)}m"
+    if not hit:
+        raise RuntimeError(f"token refresh rate-limited, retrying in {wait}; no cached usage yet")
+    log(f"'{name}': token refresh rate-limited, using usage from {int((time.time() - hit['t']) // 60)}m ago "
+        f"(retry in {wait})")
+    return hit["usage"]
 
 
 def _fetch_usage_for(name, active):
