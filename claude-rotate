@@ -12,6 +12,7 @@ On macOS the live credentials are read from / written to the Keychain.
 """
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -194,6 +195,24 @@ def read_live():
             except ValueError:
                 pass
     return read_json(LIVE_CREDS)
+
+
+def read_login_keychain(config_dir):
+    """macOS: a login with a custom CLAUDE_CONFIG_DIR is stored in the Keychain under
+    'Claude Code-credentials-<sha256(dir)[:8]>' instead of in the config dir. Read and delete it."""
+    if sys.platform != "darwin":
+        return None
+    for d in dict.fromkeys([config_dir, os.path.realpath(config_dir)]):
+        svc = f"{KEYCHAIN_SERVICE}-{hashlib.sha256(d.encode()).hexdigest()[:8]}"
+        r = subprocess.run(["security", "find-generic-password", "-s", svc, "-w"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            subprocess.run(["security", "delete-generic-password", "-s", svc], capture_output=True)
+            try:
+                return json.loads(r.stdout)
+            except ValueError:
+                return None
+    return None
 
 
 def write_live(creds):
@@ -409,7 +428,7 @@ def cmd_add(a):
             print("Log in with the Claude account to add (your current login is not touched)...")
             subprocess.run(["claude", "auth", "login", "--claudeai"],
                            env={**os.environ, "CLAUDE_CONFIG_DIR": tmp}, check=False)
-            creds = read_json(os.path.join(tmp, ".credentials.json"))
+            creds = read_json(os.path.join(tmp, ".credentials.json")) or read_login_keychain(tmp)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         if not creds:

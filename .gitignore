@@ -1,3 +1,4 @@
 subs/
 state.json
 lock
+daemon.log
