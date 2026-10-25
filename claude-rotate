@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""claude-rotate: rotate Claude Code between several Claude subscriptions.
+
+Each account ("sub") is stored in ./subs/ as a copy of Claude Code's .credentials.json.
+Add one with `./claude-rotate add-sub` (runs the normal login flow in isolation).
+The daemon polls the active account's usage (the same endpoint /usage uses) and,
+once any window crosses the threshold, atomically swaps the credentials file for
+the least-used profile. Running Claude Code sessions notice the file's mtime
+change and pick up the new account without a restart.
+
+Linux only (on macOS Claude Code keeps credentials in the Keychain).
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+LIVE_CREDS = os.path.join(CLAUDE_DIR, ".credentials.json")
+HOME = os.environ.get("CLAUDE_ROTATE_HOME") or os.path.dirname(os.path.realpath(__file__))
+PROFILES = os.path.join(HOME, "subs")
+STATE = os.path.join(HOME, "state.json")
+LOCK = os.path.join(HOME, "lock")
+
+API = "https://api.anthropic.com"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+BETA = "oauth-2025-04-20"
+WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet")
+WINDOW_LABEL = {"five_hour": "5h", "seven_day": "7d", "seven_day_opus": "7d-opus", "seven_day_sonnet": "7d-sonnet"}
+REFRESH_SKEW_MS = 5 * 60 * 1000
+INACTIVE_CACHE_S = 600  # the usage endpoint rate-limits; idle subs only need occasional checks
+
+
+class RateLimited(RuntimeError):
+    pass
+
+
+def log(msg):
+    ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+# ---------- files ----------
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
+
+def write_json_atomic(path, data):
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def profile_path(name):
+    return os.path.join(PROFILES, f"{name}.json")
+
+
+def list_profiles():
+    if not os.path.isdir(PROFILES):
+        return []
+    return sorted(f[:-5] for f in os.listdir(PROFILES) if f.endswith(".json"))
+
+
+def load_profile(name):
+    p = read_json(profile_path(name))
+    if p is None:
+        sys.exit(f"no such sub: {name}")
+    return p
+
+
+def save_profile(name, p):
+    write_json_atomic(profile_path(name), p)
+
+
+def get_state():
+    return read_json(STATE, {})
+
+
+def set_state(**kw):
+    s = get_state()
+    s.update(kw)
+    write_json_atomic(STATE, s)
+
+
+class Lock:
+    """flock so the daemon and manual commands never interleave."""
+
+    def __enter__(self):
+        import fcntl
+        os.makedirs(HOME, mode=0o700, exist_ok=True)
+        self.f = open(LOCK, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        self.f.close()
+
+
+# ---------- HTTP ----------
+
+def http(method, url, token=None, body=None, timeout=20):
+    headers = {"Content-Type": "application/json", "User-Agent": "claude-rotate/1.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["anthropic-beta"] = BETA
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read() or b"{}")
+        except ValueError:
+            payload = {}
+        return e.code, payload
+
+
+def fetch_account(token):
+    code, data = http("GET", f"{API}/api/oauth/profile", token)
+    if code != 200:
+        return None
+    acct = data.get("account") or {}
+    return {"uuid": acct.get("uuid"), "email": acct.get("email")}
+
+
+def fetch_usage(token):
+    code, data = http("GET", f"{API}/api/oauth/usage", token)
+    if code == 429:
+        raise RateLimited("usage endpoint rate-limited (HTTP 429)")
+    if code != 200:
+        raise RuntimeError(f"usage endpoint returned HTTP {code}: {data}")
+    return data
+
+
+def refresh(oauth):
+    """Refresh an INACTIVE profile's tokens. Never call this on the live account:
+    Claude Code refreshes that one itself and refresh tokens are single-use."""
+    code, data = http("POST", TOKEN_URL, body={
+        "grant_type": "refresh_token",
+        "refresh_token": oauth["refreshToken"],
+        "client_id": CLIENT_ID,
+        "scope": " ".join(oauth.get("scopes") or ["user:profile", "user:inference"]),
+    })
+    if code != 200:
+        raise RuntimeError(f"token refresh failed (HTTP {code}): {data}")
+    oauth = dict(oauth)
+    oauth["accessToken"] = data["access_token"]
+    oauth["refreshToken"] = data.get("refresh_token", oauth["refreshToken"])
+    oauth["expiresAt"] = int(time.time() * 1000) + int(data["expires_in"]) * 1000
+    if data.get("refresh_token_expires_in"):
+        oauth["refreshTokenExpiresAt"] = int(time.time() * 1000) + int(data["refresh_token_expires_in"]) * 1000
+    return oauth
+
+
+def expired(oauth):
+    return oauth.get("expiresAt", 0) < time.time() * 1000 + REFRESH_SKEW_MS
+
+
+# ---------- core ----------
+
+def sync_live_into_active():
+    """Claude Code rotates the live refresh token; copy it back into the active
+    profile so switching away (and later back) never resurrects a dead token.
+    Only syncs if the live file really belongs to the active account."""
+    active = get_state().get("active")
+    live = read_json(LIVE_CREDS)
+    if not active or not live or "claudeAiOauth" not in live:
+        return
+    prof = read_json(profile_path(active))
+    if prof is None:
+        return
+    if live["claudeAiOauth"].get("refreshToken") == prof["creds"]["claudeAiOauth"].get("refreshToken") \
+            and live["claudeAiOauth"].get("accessToken") == prof["creds"]["claudeAiOauth"].get("accessToken"):
+        return
+    acct = fetch_account(live["claudeAiOauth"]["accessToken"])
+    if acct is None:
+        return  # token momentarily invalid; try again next tick
+    if prof.get("account", {}).get("uuid") and acct["uuid"] != prof["account"]["uuid"]:
+        log(f"WARNING: live credentials are {acct['email']}, not sub '{active}' "
+            f"({prof['account'].get('email')}); someone ran /login manually. Not syncing.")
+        match = next((n for n in list_profiles()
+                      if load_profile(n).get("account", {}).get("uuid") == acct["uuid"]), None)
+        if match:
+            log(f"live account matches sub '{match}'; marking it active")
+            set_state(active=match)
+            p = load_profile(match)
+            p["creds"] = live
+            save_profile(match, p)
+        return
+    prof["creds"] = live
+    save_profile(active, prof)
+
+
+def usage_for(name, active, max_age=0):
+    """Return usage dict for a sub, refreshing inactive tokens as needed.
+    Results younger than max_age seconds come from the cache in state.json."""
+    cache = get_state().get("usage_cache", {})
+    hit = cache.get(name)
+    if hit and time.time() - hit["t"] < max_age and not reset_passed(hit["usage"]):
+        return hit["usage"]
+    u = _fetch_usage_for(name, active)
+    cache[name] = {"t": time.time(), "usage": u}
+    set_state(usage_cache=cache)
+    return u
+
+
+def _fetch_usage_for(name, active):
+    prof = load_profile(name)
+    if name == active:
+        live = read_json(LIVE_CREDS) or prof["creds"]
+        oauth = live["claudeAiOauth"]
+        if expired(oauth):
+            raise RuntimeError("live token expired (Claude Code refreshes it on next request)")
+    else:
+        oauth = prof["creds"]["claudeAiOauth"]
+        if expired(oauth):
+            oauth = refresh(oauth)
+            prof["creds"]["claudeAiOauth"] = oauth
+            save_profile(name, prof)
+    return fetch_usage(oauth["accessToken"])
+
+
+def parse_reset(iso):
+    return dt.datetime.fromisoformat(iso).timestamp() if iso else None
+
+
+def reset_passed(usage):
+    """True once any window in a cached usage reading has rolled over."""
+    now = time.time()
+    return any(isinstance(usage.get(w), dict) and (parse_reset(usage[w].get("resets_at")) or now + 1) <= now
+               for w in WINDOWS)
+
+
+def binding(usage):
+    """(utilization, window, reset epoch) of the window closest to its limit.
+    The 5h and weekly windows compete equally: whichever is highest decides."""
+    best = (0.0, None, None)
+    for w in WINDOWS:
+        d = usage.get(w)
+        if not isinstance(d, dict) or d.get("utilization") is None:
+            continue
+        u = 100.0 if d.get("locked_reason") else float(d["utilization"])
+        if best[1] is None or u > best[0]:
+            best = (u, w, parse_reset(d.get("resets_at")))
+    return best
+
+
+def score(usage):
+    return binding(usage)[0]
+
+
+def pick(cands, limit, tie=5.0):
+    """Least-used candidate under `limit`. Among candidates within `tie` points of
+    the least-used one, prefer the one whose limiting window resets first: its
+    remaining headroom expires soonest, so spend it now (use it or lose it)."""
+    ok = [c for c in cands if c[1] < limit]
+    if not ok:
+        return None
+    low = min(c[1] for c in ok)
+    # resets are compared by the hour so near-identical ones fall through to usage
+    return min((c for c in ok if c[1] <= low + tie), key=lambda c: ((c[3] or float("inf")) // 3600, c[1]))
+
+
+def describe(c):
+    name, u, w, reset = c
+    return f"'{name}' {WINDOW_LABEL.get(w, w)} {u:.0f}%" + (f" (resets in {fmt_in(reset)})" if reset else "")
+
+
+def activate(name, reason=""):
+    sync_live_into_active()
+    prof = load_profile(name)
+    oauth = prof["creds"]["claudeAiOauth"]
+    if expired(oauth):
+        oauth = refresh(oauth)
+        prof["creds"]["claudeAiOauth"] = oauth
+        save_profile(name, prof)
+    write_json_atomic(LIVE_CREDS, prof["creds"])
+    prev = get_state().get("active")
+    set_state(active=name, switched_at=int(time.time()))
+    who = prof.get("account", {}).get("email", "?")
+    log(f"switched {prev or '-'} -> {name} ({who}){' : ' + reason if reason else ''}")
+    hook = os.environ.get("CLAUDE_ROTATE_ON_SWITCH")
+    if hook:
+        subprocess.run(hook, shell=True, env={**os.environ, "FROM": prev or "", "TO": name, "REASON": reason})
+
+
+def check_once(threshold, margin, hard, verbose=False):
+    """Decide whether to switch. Usage = the highest of the 5h and weekly windows.
+
+    1. active below `threshold`: stay.
+    2. active at/above `threshold`: switch to the least-used sub under threshold-margin.
+    3. no such sub: keep using the active one until `hard`, then drain the
+       leftovers: switch to the least-used sub still under `hard`.
+    4. everything at `hard`: wait; a sub becomes eligible again as soon as its
+       limiting window (often the 5h one) resets.
+    """
+    with Lock():
+        sync_live_into_active()
+        active = get_state().get("active")
+        names = list_profiles()
+        if not names:
+            log("no subs; run `./claude-rotate add-sub` first")
+            return
+        if active not in names:
+            activate(names[0], "no active sub")
+            return
+        try:
+            cur = (active, *binding(usage_for(active, active)))
+        except RateLimited:
+            raise
+        except Exception as e:
+            log(f"could not read usage for '{active}': {e}")
+            return
+        if verbose:
+            log(f"active {describe(cur)} (switch at {threshold:.0f}%, drain at {hard:.0f}%)")
+        if cur[1] < threshold:
+            return
+        cands = []
+        for n in names:
+            if n == active:
+                continue
+            try:
+                cands.append((n, *binding(usage_for(n, active, INACTIVE_CACHE_S))))
+            except RateLimited:
+                raise
+            except Exception as e:
+                log(f"skipping '{n}': {e}")
+        best = pick(cands, threshold - margin)
+        if best:
+            activate(best[0], f"{describe(cur)} -> {describe(best)}")
+            return
+        if cur[1] < hard:
+            if verbose:
+                log(f"no sub under {threshold - margin:.0f}%; staying on '{active}' until {hard:.0f}%")
+            return
+        best = pick(cands, hard, tie=2.0)  # little left anywhere: a couple of points matters
+        if best:
+            activate(best[0], f"draining leftovers: {describe(cur)} -> {describe(best)}")
+            return
+        soonest = min([cur] + cands, key=lambda c: c[3] or float("inf"))
+        log(f"every sub is at its limit; first to free up: {describe(soonest)}")
+
+
+# ---------- commands ----------
+
+def cmd_add(a):
+    """Log in to a new account in an isolated config dir so the current login is untouched."""
+    if a.name and os.path.exists(profile_path(a.name)) and not a.force:
+        sys.exit(f"sub '{a.name}' exists (use --force to replace)")
+    if a.from_current:
+        creds = read_json(LIVE_CREDS)
+        if not creds:
+            sys.exit(f"no credentials at {LIVE_CREDS}")
+    else:
+        tmp = tempfile.mkdtemp(prefix="claude-rotate-login-")
+        try:
+            print("Log in with the Claude account to add (your current login is not touched)...")
+            subprocess.run(["claude", "auth", "login", "--claudeai"],
+                           env={**os.environ, "CLAUDE_CONFIG_DIR": tmp}, check=False)
+            creds = read_json(os.path.join(tmp, ".credentials.json"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if not creds:
+            sys.exit("login did not produce credentials")
+    acct = fetch_account(creds["claudeAiOauth"]["accessToken"]) or {}
+    if not a.name:
+        base = re.sub(r"[^A-Za-z0-9_.-]", "_", (acct.get("email") or "sub").split("@")[0])
+        a.name, i = base, 2
+        while os.path.exists(profile_path(a.name)):
+            if load_profile(a.name).get("account", {}).get("uuid") == acct.get("uuid"):
+                break  # re-adding the same account refreshes its sub
+            a.name, i = f"{base}{i}", i + 1
+    for n in list_profiles():
+        if n != a.name and acct.get("uuid") and load_profile(n).get("account", {}).get("uuid") == acct["uuid"]:
+            sys.exit(f"that account ({acct.get('email')}) is already sub '{n}'")
+    with Lock():
+        save_profile(a.name, {"account": acct, "creds": creds})
+        if not get_state().get("active"):
+            live = read_json(LIVE_CREDS)
+            live_acct = live and fetch_account(live["claudeAiOauth"]["accessToken"])
+            if live_acct and live_acct.get("uuid") == acct.get("uuid"):
+                set_state(active=a.name)
+    print(f"saved sub '{a.name}' ({acct.get('email', '?')}, "
+          f"{creds['claudeAiOauth'].get('subscriptionType', '?')})")
+
+
+def fmt_reset(iso):
+    return fmt_in(parse_reset(iso)) if iso else ""
+
+
+def fmt_in(epoch):
+    secs = epoch - time.time()
+    if secs <= 0:
+        return "now"
+    h, m = divmod(int(secs) // 60, 60)
+    return f"{h // 24}d{h % 24}h" if h >= 24 else f"{h}h{m:02d}m"
+
+
+def cmd_status(a):
+    with Lock():
+        sync_live_into_active()
+        active = get_state().get("active")
+        print(f"{'':2}{'SUB':<18}{'ACCOUNT':<32}{'PLAN':<8}{'5H':>5} {'RESET':>7}{'7D':>6} {'RESET':>7}")
+        for n in list_profiles():
+            p = load_profile(n)
+            mark = "* " if n == active else "  "
+            email = p.get("account", {}).get("email", "?")
+            plan = p["creds"]["claudeAiOauth"].get("subscriptionType", "?")
+            try:
+                u = usage_for(n, active, 60)
+                fh, sd = u.get("five_hour") or {}, u.get("seven_day") or {}
+                print(f"{mark}{n:<18}{email:<32}{plan:<8}"
+                      f"{fh.get('utilization', 0):>4.0f}% {fmt_reset(fh.get('resets_at')):>7}"
+                      f"{sd.get('utilization', 0):>5.0f}% {fmt_reset(sd.get('resets_at')):>7}")
+            except Exception as e:
+                print(f"{mark}{n:<18}{email:<32}{plan:<8}  error: {e}")
+
+
+def cmd_use(a):
+    with Lock():
+        load_profile(a.name)
+        activate(a.name, "manual")
+
+
+def cmd_remove(a):
+    with Lock():
+        if get_state().get("active") == a.name:
+            sys.exit("cannot remove the active sub; `use` another one first")
+        os.unlink(profile_path(a.name))
+    print(f"removed '{a.name}'")
+
+
+def cmd_check(a):
+    try:
+        check_once(a.threshold, a.margin, a.hard, verbose=True)
+    except RateLimited as e:
+        log(f"{e}; try again later")
+
+
+def cmd_daemon(a):
+    log(f"daemon started: threshold {a.threshold}%, hard {a.hard}%, interval {a.interval}s, subs {list_profiles()}")
+    delay = a.interval
+    while True:
+        try:
+            check_once(a.threshold, a.margin, a.hard, verbose=a.verbose)
+            delay = a.interval
+        except RateLimited as e:
+            delay = min(delay * 2, 1800)
+            log(f"{e}; backing off to {delay}s")
+        except Exception as e:
+            log(f"error: {e}")
+        time.sleep(delay)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="claude-rotate", description=__doc__.split("\n")[0])
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sp.add_parser("add-sub", help="log in to a Claude account and store it in subs/")
+    p.add_argument("name", nargs="?", help="defaults to the account email's local part")
+    p.add_argument("--from-current", action="store_true",
+                   help="save the account Claude Code is logged in with right now instead of logging in")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_add)
+
+    sp.add_parser("status", help="show usage for every sub").set_defaults(fn=cmd_status)
+
+    p = sp.add_parser("use", help="switch to a sub now")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_use)
+
+    p = sp.add_parser("remove", help="delete a sub")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_remove)
+
+    for name, fn, h in (("check", cmd_check, "check once and switch if needed (for cron)"),
+                        ("daemon", cmd_daemon, "check in a loop")):
+        p = sp.add_parser(name, help=h)
+        p.add_argument("--threshold", type=float, default=float(os.environ.get("CLAUDE_ROTATE_THRESHOLD", 90)),
+                       help="switch when any usage window reaches this %% (default 90)")
+        p.add_argument("--margin", type=float, default=10,
+                       help="only switch to a sub at least this many points under the threshold (default 10)")
+        p.add_argument("--hard", type=float, default=98,
+                       help="when no sub is under threshold-margin, keep going until this %%, then drain "
+                            "whichever sub has the most left (default 98)")
+        if name == "daemon":
+            p.add_argument("--interval", type=int, default=180, help="seconds between checks (default 180)")
+            p.add_argument("-v", "--verbose", action="store_true")
+        p.set_defaults(fn=fn)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

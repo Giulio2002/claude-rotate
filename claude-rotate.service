@@ -1,0 +1,13 @@
+[Unit]
+Description=Rotate Claude Code subscriptions before they hit their usage limit
+After=network-online.target
+
+[Service]
+ExecStart=/root/claude-rotate/claude-rotate daemon --threshold 90
+Restart=always
+RestartSec=30
+# Optional: run something on each switch ($FROM, $TO, $REASON are set)
+#Environment=CLAUDE_ROTATE_ON_SWITCH=notify-send "Claude sub: $FROM -> $TO"
+
+[Install]
+WantedBy=default.target
