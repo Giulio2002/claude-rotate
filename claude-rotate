@@ -8,7 +8,7 @@ once any window crosses the threshold, atomically swaps the credentials file for
 the least-used profile. Running Claude Code sessions notice the file's mtime
 change and pick up the new account without a restart.
 
-Linux only (on macOS Claude Code keeps credentials in the Keychain).
+On macOS the live credentials are read from / written to the Keychain.
 """
 import argparse
 import datetime as dt
@@ -179,6 +179,34 @@ def refresh(oauth):
 def expired(oauth):
     return oauth.get("expiresAt", 0) < time.time() * 1000 + REFRESH_SKEW_MS
 
+# On macOS Claude Code keeps the live credentials in the login Keychain (default config dir only).
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+USE_KEYCHAIN = sys.platform == "darwin" and not os.environ.get("CLAUDE_CONFIG_DIR")
+
+
+def read_live():
+    if USE_KEYCHAIN:
+        r = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            try:
+                return json.loads(r.stdout)
+            except ValueError:
+                pass
+    return read_json(LIVE_CREDS)
+
+
+def write_live(creds):
+    if USE_KEYCHAIN:
+        user = os.environ.get("USER") or os.path.basename(os.path.expanduser("~"))
+        hexdata = json.dumps(creds).encode().hex()
+        # via stdin so the secret never appears in argv
+        r = subprocess.run(["security", "-i"], text=True, capture_output=True,
+                           input=f"add-generic-password -U -a {user} -s '{KEYCHAIN_SERVICE}' -X {hexdata}\n")
+        if r.returncode != 0:
+            raise RuntimeError(f"keychain write failed: {r.stderr.strip()}")
+    write_json_atomic(LIVE_CREDS, creds)
+
 
 # ---------- core ----------
 
@@ -187,7 +215,7 @@ def sync_live_into_active():
     profile so switching away (and later back) never resurrects a dead token.
     Only syncs if the live file really belongs to the active account."""
     active = get_state().get("active")
-    live = read_json(LIVE_CREDS)
+    live = read_live()
     if not active or not live or "claudeAiOauth" not in live:
         return
     prof = read_json(profile_path(active))
@@ -231,7 +259,7 @@ def usage_for(name, active, max_age=0):
 def _fetch_usage_for(name, active):
     prof = load_profile(name)
     if name == active:
-        live = read_json(LIVE_CREDS) or prof["creds"]
+        live = read_live() or prof["creds"]
         oauth = live["claudeAiOauth"]
         if expired(oauth):
             raise RuntimeError("live token expired (Claude Code refreshes it on next request)")
@@ -298,7 +326,7 @@ def activate(name, reason=""):
         oauth = refresh(oauth)
         prof["creds"]["claudeAiOauth"] = oauth
         save_profile(name, prof)
-    write_json_atomic(LIVE_CREDS, prof["creds"])
+    write_live(prof["creds"])
     prev = get_state().get("active")
     set_state(active=name, switched_at=int(time.time()))
     who = prof.get("account", {}).get("email", "?")
@@ -372,7 +400,7 @@ def cmd_add(a):
     if a.name and os.path.exists(profile_path(a.name)) and not a.force:
         sys.exit(f"sub '{a.name}' exists (use --force to replace)")
     if a.from_current:
-        creds = read_json(LIVE_CREDS)
+        creds = read_live()
         if not creds:
             sys.exit(f"no credentials at {LIVE_CREDS}")
     else:
@@ -400,7 +428,7 @@ def cmd_add(a):
     with Lock():
         save_profile(a.name, {"account": acct, "creds": creds})
         if not get_state().get("active"):
-            live = read_json(LIVE_CREDS)
+            live = read_live()
             live_acct = live and fetch_account(live["claudeAiOauth"]["accessToken"])
             if live_acct and live_acct.get("uuid") == acct.get("uuid"):
                 set_state(active=a.name)
