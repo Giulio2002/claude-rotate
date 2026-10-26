@@ -10,7 +10,8 @@ Switches Claude Code to another of your Claude subscriptions before the current 
                                    #   extra-usage credits, data age, daemon state, next sub to free up
 ./claude-rotate status -v          # + token expiry, per-model weekly limits, usage by surface
 ./claude-rotate status --json      # machine-readable
-./claude-rotate --censor status    # mask account emails (any command; or CLAUDE_ROTATE_CENSOR=1)
+./claude-rotate --censor status    # mask emails and sub names (any command; or CLAUDE_ROTATE_CENSOR=1);
+                                   #   names become stable aliases like gi-3fa1, which `use`/`remove` accept
 ./claude-rotate use <sub>          # switch now
 ./claude-rotate check              # one check (cron-friendly)
 ./claude-rotate daemon             # check every 3 min, switch at 90%

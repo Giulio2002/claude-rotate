@@ -64,7 +64,37 @@ def mask(email):
     return f"{local[:2]}***@{(host or tld)[:1]}***{dot}{tld if host else ''}"
 
 
+def alias(name):
+    """Stable masked sub name for --censor ('giulio.rebuffo' -> 'gi-3fa1'); `use`/`remove` accept it."""
+    return f"{name[:2]}-{hashlib.sha256(name.encode()).hexdigest()[:4]}"
+
+
+def scrub(text):
+    """With --censor, replace every sub name and stored email in text (longest first)."""
+    if not CENSOR:
+        return text
+    pairs = []
+    for n in list_profiles():
+        email = (read_json(profile_path(n)) or {}).get("account", {}).get("email")
+        if email:
+            pairs.append((email, mask(email)))
+        pairs.append((n, alias(n)))
+    for old, new in sorted(pairs, key=lambda x: -len(x[0])):
+        text = text.replace(old, new)
+    return text
+
+
+def resolve(name):
+    """Accept a sub name or its --censor alias."""
+    names = list_profiles()
+    if name in names:
+        return name
+    hit = [n for n in names if alias(n) == name]
+    return hit[0] if hit else name
+
+
 def log(msg):
+    msg = scrub(msg)
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
@@ -507,8 +537,8 @@ def cmd_add(a):
             live_acct = live and fetch_account(live["claudeAiOauth"]["accessToken"])
             if live_acct and live_acct.get("uuid") == acct.get("uuid"):
                 set_state(active=a.name)
-    print(f"saved sub '{a.name}' ({mask(acct.get('email', '?'))}, "
-          f"{creds['claudeAiOauth'].get('subscriptionType', '?')})")
+    print(scrub(f"saved sub '{a.name}' ({mask(acct.get('email', '?'))}, "
+          f"{creds['claudeAiOauth'].get('subscriptionType', '?')})"))
 
 
 def fmt_reset(iso):
@@ -544,7 +574,7 @@ def daemon_pid():
 def sub_status(n, active):
     p = load_profile(n)
     oauth = p["creds"]["claudeAiOauth"]
-    row = {"name": n, "active": n == active, "email": mask(p.get("account", {}).get("email", "?")),
+    row = {"name": alias(n) if CENSOR else n, "active": n == active, "email": mask(p.get("account", {}).get("email", "?")),
            "plan": plan_label(oauth), "token_expires_in_s": int(oauth.get("expiresAt", 0) / 1000 - time.time())}
     try:
         u = usage_for(n, active, 60)
@@ -584,7 +614,7 @@ def cmd_status(a):
     free = [r for r in rows if "binding" in r]
     first = min(free, key=lambda r: (r["binding"]["pct"] < a.hard and -1, r["binding"]["resets_at"] or 0), default=None)
     if a.json:
-        print(json.dumps({"active": active, "switched_at": st.get("switched_at"), "daemon_pid": daemon_pid(), "subs": rows}, indent=1))
+        print(json.dumps({"active": alias(active) if CENSOR and active else active, "switched_at": st.get("switched_at"), "daemon_pid": daemon_pid(), "subs": rows}, indent=1))
         return
     cell = lambda w: f"{w['pct']:>4.0f}% {fmt_in(w['resets_at']) if w.get('resets_at') else '':>7}" if w else f"{'-':>5} {'':>7}"
     print(f"{'':2}{'SUB':<18}{'ACCOUNT':<28}{'PLAN':<9}{'5H':>5} {'RESET':>7}{'7D':>6} {'RESET':>7}  {'LIMIT':<9}{'EXTRA':<7}{'AGE':>5}")
@@ -608,24 +638,26 @@ def cmd_status(a):
                   + (f"; 7d by surface: " + ", ".join(f"{k} {v}%" for k, v in r["breakdown_7d"].items()) if r["breakdown_7d"] else ""))
     pid = daemon_pid()
     print()
-    print(f"active: {active or '-'}" + (f" for {fmt_ago(st['switched_at'])}" if st.get("switched_at") else "")
+    print(f"active: {(alias(active) if CENSOR and active else active) or '-'}" + (f" for {fmt_ago(st['switched_at'])}" if st.get("switched_at") else "")
           + f" | daemon: {'running (pid ' + pid + ')' if pid else 'NOT running'}"
           + (f" | next to free up: {first['name']} ({first['binding']['window']} resets in {fmt_in(first['binding']['resets_at'])})"
              if first and first["binding"]["pct"] >= a.hard and first["binding"]["resets_at"] else ""))
 
 
 def cmd_use(a):
+    a.name = resolve(a.name)
     with Lock():
         load_profile(a.name)
         activate(a.name, "manual")
 
 
 def cmd_remove(a):
+    a.name = resolve(a.name)
     with Lock():
         if get_state().get("active") == a.name:
             sys.exit("cannot remove the active sub; `use` another one first")
         os.unlink(profile_path(a.name))
-    print(f"removed '{a.name}'")
+    print(scrub(f"removed '{a.name}'"))
 
 
 def cmd_check(a):
