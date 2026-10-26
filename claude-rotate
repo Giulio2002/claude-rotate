@@ -129,8 +129,13 @@ class Lock:
 
 # ---------- HTTP ----------
 
-def http(method, url, token=None, body=None, timeout=20):
-    headers = {"Content-Type": "application/json", "User-Agent": "claude-code/2.1.310"}
+# Claude Code's token refresh is a bare axios POST (no custom User-Agent). The token endpoint
+# persistently answers 429 to a "claude-code/..." User-Agent there, so match axios exactly.
+REFRESH_HEADERS = {"User-Agent": "axios/1.9.0", "Accept": "application/json, text/plain, */*"}
+
+
+def http(method, url, token=None, body=None, timeout=20, headers=None):
+    headers = {"Content-Type": "application/json", "User-Agent": "claude-code/2.1.310", **(headers or {})}
     if token:
         headers["Authorization"] = f"Bearer {token}"
         headers["anthropic-beta"] = BETA
@@ -172,7 +177,7 @@ def refresh(oauth):
         "refresh_token": oauth["refreshToken"],
         "client_id": CLIENT_ID,
         "scope": " ".join(oauth.get("scopes") or ["user:profile", "user:inference"]),
-    })
+    }, headers=REFRESH_HEADERS)
     if code == 429:
         raise RefreshRateLimited(f"token refresh rate-limited (HTTP 429): {data}")
     if code != 200:
