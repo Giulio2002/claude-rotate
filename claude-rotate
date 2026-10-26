@@ -52,6 +52,18 @@ class RefreshRateLimited(RuntimeError):
     """The token endpoint returned 429 for an idle sub's refresh."""
 
 
+CENSOR = os.environ.get("CLAUDE_ROTATE_CENSOR", "") not in ("", "0")
+
+
+def mask(email):
+    """'giulio.rebuffo@gmail.com' -> 'gi***@g***.com' when --censor (or CLAUDE_ROTATE_CENSOR=1) is set."""
+    if not CENSOR or not email or "@" not in email:
+        return email
+    local, _, domain = email.partition("@")
+    host, dot, tld = domain.rpartition(".")
+    return f"{local[:2]}***@{(host or tld)[:1]}***{dot}{tld if host else ''}"
+
+
 def log(msg):
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
@@ -268,8 +280,8 @@ def sync_live_into_active():
     if acct is None:
         return  # token momentarily invalid; try again next tick
     if prof.get("account", {}).get("uuid") and acct["uuid"] != prof["account"]["uuid"]:
-        log(f"WARNING: live credentials are {acct['email']}, not sub '{active}' "
-            f"({prof['account'].get('email')}); someone ran /login manually. Not syncing.")
+        log(f"WARNING: live credentials are {mask(acct['email'])}, not sub '{active}' "
+            f"({mask(prof['account'].get('email'))}); someone ran /login manually. Not syncing.")
         match = next((n for n in list_profiles()
                       if load_profile(n).get("account", {}).get("uuid") == acct["uuid"]), None)
         if match:
@@ -392,7 +404,7 @@ def activate(name, reason=""):
     write_live(prof["creds"])
     prev = get_state().get("active")
     set_state(active=name, switched_at=int(time.time()))
-    who = prof.get("account", {}).get("email", "?")
+    who = mask(prof.get("account", {}).get("email", "?"))
     log(f"switched {prev or '-'} -> {name} ({who}){' : ' + reason if reason else ''}")
     hook = os.environ.get("CLAUDE_ROTATE_ON_SWITCH")
     if hook:
@@ -487,7 +499,7 @@ def cmd_add(a):
             a.name, i = f"{base}{i}", i + 1
     for n in list_profiles():
         if n != a.name and acct.get("uuid") and load_profile(n).get("account", {}).get("uuid") == acct["uuid"]:
-            sys.exit(f"that account ({acct.get('email')}) is already sub '{n}'")
+            sys.exit(f"that account ({mask(acct.get('email'))}) is already sub '{n}'")
     with Lock():
         save_profile(a.name, {"account": acct, "creds": creds})
         if not get_state().get("active"):
@@ -495,7 +507,7 @@ def cmd_add(a):
             live_acct = live and fetch_account(live["claudeAiOauth"]["accessToken"])
             if live_acct and live_acct.get("uuid") == acct.get("uuid"):
                 set_state(active=a.name)
-    print(f"saved sub '{a.name}' ({acct.get('email', '?')}, "
+    print(f"saved sub '{a.name}' ({mask(acct.get('email', '?'))}, "
           f"{creds['claudeAiOauth'].get('subscriptionType', '?')})")
 
 
@@ -511,24 +523,95 @@ def fmt_in(epoch):
     return f"{h // 24}d{h % 24}h" if h >= 24 else f"{h}h{m:02d}m"
 
 
+def plan_label(oauth):
+    """'max' + rateLimitTier 'default_claude_max_20x' -> 'max20x'."""
+    plan = oauth.get("subscriptionType") or "?"
+    m = re.search(r"(\d+x)$", oauth.get("rateLimitTier") or "")
+    return plan + (m.group(1) if m else "")
+
+
+def fmt_ago(epoch):
+    secs = max(0, int(time.time() - epoch))
+    return f"{secs}s" if secs < 60 else f"{secs // 60}m" if secs < 3600 else f"{secs // 3600}h{secs % 3600 // 60:02d}m"
+
+
+def daemon_pid():
+    r = subprocess.run(["pgrep", "-f", "claude-rotate daemon"], capture_output=True, text=True)
+    pids = [x for x in r.stdout.split() if x != str(os.getpid())]
+    return pids[0] if pids else None
+
+
+def sub_status(n, active):
+    p = load_profile(n)
+    oauth = p["creds"]["claudeAiOauth"]
+    row = {"name": n, "active": n == active, "email": mask(p.get("account", {}).get("email", "?")),
+           "plan": plan_label(oauth), "token_expires_in_s": int(oauth.get("expiresAt", 0) / 1000 - time.time())}
+    try:
+        u = usage_for(n, active, 60)
+    except Exception as e:
+        row["error"] = str(e)
+        return row
+    st = get_state()
+    hit = st.get("usage_cache", {}).get(n)
+    row["age_s"] = int(time.time() - hit["t"]) if hit else 0
+    bo = st.get("refresh_backoff", {}).get(n)
+    if bo and bo["until"] > time.time():
+        row["refresh_backoff_s"] = int(bo["until"] - time.time())
+    for w in WINDOWS:
+        d = u.get(w)
+        if isinstance(d, dict) and d.get("utilization") is not None:
+            row[WINDOW_LABEL[w]] = {"pct": d["utilization"], "resets_at": parse_reset(d.get("resets_at")) if d.get("resets_at") else None,
+                                    "locked": d.get("locked_reason")}
+    pct, w, reset = binding(u)
+    row["binding"] = {"window": WINDOW_LABEL.get(w, w), "pct": pct, "resets_at": reset}
+    row["scoped"] = [{"model": ((l.get("scope") or {}).get("model") or {}).get("display_name"), "pct": l.get("percent"),
+                      "resets_at": parse_reset(l["resets_at"]) if l.get("resets_at") else None}
+                     for l in u.get("limits") or [] if l.get("kind") == "weekly_scoped"]
+    ex = u.get("extra_usage") or {}
+    row["extra"] = {"enabled": bool(ex.get("is_enabled")), "used": ex.get("used_credits"), "limit": ex.get("monthly_limit"),
+                    "pct": ex.get("utilization"), "currency": ex.get("currency")}
+    bd = u.get("seven_day_breakdown") or {}
+    row["breakdown_7d"] = {r["display_name"]: r["percent"] for r in bd.get("rows") or [] if r.get("percent")}
+    return row
+
+
 def cmd_status(a):
     with Lock():
         sync_live_into_active()
-        active = get_state().get("active")
-        print(f"{'':2}{'SUB':<18}{'ACCOUNT':<32}{'PLAN':<8}{'5H':>5} {'RESET':>7}{'7D':>6} {'RESET':>7}")
-        for n in list_profiles():
-            p = load_profile(n)
-            mark = "* " if n == active else "  "
-            email = p.get("account", {}).get("email", "?")
-            plan = p["creds"]["claudeAiOauth"].get("subscriptionType", "?")
-            try:
-                u = usage_for(n, active, 60)
-                fh, sd = u.get("five_hour") or {}, u.get("seven_day") or {}
-                print(f"{mark}{n:<18}{email:<32}{plan:<8}"
-                      f"{fh.get('utilization', 0):>4.0f}% {fmt_reset(fh.get('resets_at')):>7}"
-                      f"{sd.get('utilization', 0):>5.0f}% {fmt_reset(sd.get('resets_at')):>7}")
-            except Exception as e:
-                print(f"{mark}{n:<18}{email:<32}{plan:<8}  error: {e}")
+        st = get_state()
+        active = st.get("active")
+        rows = [sub_status(n, active) for n in list_profiles()]
+    free = [r for r in rows if "binding" in r]
+    first = min(free, key=lambda r: (r["binding"]["pct"] < a.hard and -1, r["binding"]["resets_at"] or 0), default=None)
+    if a.json:
+        print(json.dumps({"active": active, "switched_at": st.get("switched_at"), "daemon_pid": daemon_pid(), "subs": rows}, indent=1))
+        return
+    cell = lambda w: f"{w['pct']:>4.0f}% {fmt_in(w['resets_at']) if w.get('resets_at') else '':>7}" if w else f"{'-':>5} {'':>7}"
+    print(f"{'':2}{'SUB':<18}{'ACCOUNT':<28}{'PLAN':<9}{'5H':>5} {'RESET':>7}{'7D':>6} {'RESET':>7}  {'LIMIT':<9}{'EXTRA':<7}{'AGE':>5}")
+    for r in rows:
+        mark = "* " if r["active"] else "  "
+        head = f"{mark}{r['name']:<18}{r['email']:<28}{r['plan']:<9}"
+        if "error" in r:
+            print(f"{head}error: {r['error']}")
+            continue
+        b = r["binding"]
+        lim = f"{b['window']}" + (" FULL" if b["pct"] >= a.hard else "")
+        ex = r["extra"]
+        extra = (f"{ex['pct']:.0f}%" if ex.get("pct") is not None else "on") if ex["enabled"] else "off"
+        print(f"{head}{cell(r.get('5h'))} {cell(r.get('7d'))}  {lim:<9}{extra:<7}{fmt_ago(time.time() - r['age_s']):>5}"
+              + (f"  (refresh backoff {fmt_in(time.time() + r['refresh_backoff_s'])})" if r.get("refresh_backoff_s") else ""))
+        if a.verbose:
+            tok = r["token_expires_in_s"]
+            print(f"{'':20}token {'expires in ' + fmt_in(time.time() + tok) if tok > 0 else 'expired ' + fmt_ago(time.time() + tok) + ' ago'}"
+                  + "".join(f"; {w} {r[w]['pct']:.0f}%" for w in ("7d-opus", "7d-sonnet") if r.get(w))
+                  + "".join(f"; 7d {s['model']} {s['pct']}%" for s in r["scoped"] if s["model"])
+                  + (f"; 7d by surface: " + ", ".join(f"{k} {v}%" for k, v in r["breakdown_7d"].items()) if r["breakdown_7d"] else ""))
+    pid = daemon_pid()
+    print()
+    print(f"active: {active or '-'}" + (f" for {fmt_ago(st['switched_at'])}" if st.get("switched_at") else "")
+          + f" | daemon: {'running (pid ' + pid + ')' if pid else 'NOT running'}"
+          + (f" | next to free up: {first['name']} ({first['binding']['window']} resets in {fmt_in(first['binding']['resets_at'])})"
+             if first and first["binding"]["pct"] >= a.hard and first["binding"]["resets_at"] else ""))
 
 
 def cmd_use(a):
@@ -569,6 +652,8 @@ def cmd_daemon(a):
 
 def main():
     ap = argparse.ArgumentParser(prog="claude-rotate", description=__doc__.split("\n")[0])
+    ap.add_argument("--censor", action="store_true",
+                    help="mask account emails in all output (or set CLAUDE_ROTATE_CENSOR=1)")
     sp = ap.add_subparsers(dest="cmd", required=True)
 
     p = sp.add_parser("add-sub", help="log in to a Claude account and store it in subs/")
@@ -578,7 +663,11 @@ def main():
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_add)
 
-    sp.add_parser("status", help="show usage for every sub").set_defaults(fn=cmd_status)
+    p = sp.add_parser("status", help="show usage for every sub")
+    p.add_argument("-v", "--verbose", action="store_true", help="per-sub details: token expiry, per-model and per-surface usage")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--hard", type=float, default=98, help="%% at which a sub counts as full (default 98)")
+    p.set_defaults(fn=cmd_status)
 
     p = sp.add_parser("use", help="switch to a sub now")
     p.add_argument("name")
@@ -604,6 +693,8 @@ def main():
         p.set_defaults(fn=fn)
 
     a = ap.parse_args()
+    global CENSOR
+    CENSOR = CENSOR or a.censor
     a.fn(a)
 
 
