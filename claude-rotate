@@ -251,6 +251,13 @@ def sync_live_into_active():
     live = read_live()
     if not active or not live or "claudeAiOauth" not in live:
         return
+    if USE_KEYCHAIN and live["claudeAiOauth"].get("accessToken"):
+        f = (read_json(LIVE_CREDS) or {}).get("claudeAiOauth") or {}
+        if not f.get("accessToken"):
+            # Something left .credentials.json with blanked tokens; new Claude instances then
+            # report the login as expired although the Keychain copy is valid. Restore it.
+            write_json_atomic(LIVE_CREDS, live)
+            log("restored blank ~/.claude/.credentials.json from the Keychain")
     prof = read_json(profile_path(active))
     if prof is None:
         return
