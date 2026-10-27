@@ -367,7 +367,18 @@ def _fetch_usage_for(name, active):
         live = read_live() or prof["creds"]
         oauth = live["claudeAiOauth"]
         if expired(oauth):
-            raise RuntimeError("live token expired (Claude Code refreshes it on next request)")
+            # No Claude Code process refreshed it (idle machine): refresh it here and write it back
+            # to the live store and the profile, so the next Claude Code start finds a valid login.
+            sync_live_into_active()
+            live = read_live() or prof["creds"]
+            oauth = live["claudeAiOauth"]
+            if expired(oauth):
+                oauth = refresh(oauth)
+                live = {**live, "claudeAiOauth": oauth}
+                write_live(live)
+                prof["creds"] = live
+                save_profile(name, prof)
+                log(f"'{name}': refreshed the expired live token")
     else:
         oauth = prof["creds"]["claudeAiOauth"]
         if expired(oauth):
